@@ -89,6 +89,21 @@ func ov(args []string, timeout time.Duration) (string, error) {
 	return string(out), nil
 }
 
+// ovJSON runs ov and extracts just the JSON portion (strips any prefix lines like "cmd: ...")
+func ovJSON(args []string, timeout time.Duration) (string, error) {
+	raw, err := ov(args, timeout)
+	if err != nil {
+		return "", err
+	}
+	// Find first '{' or '['
+	for i, c := range raw {
+		if c == '{' || c == '[' {
+			return raw[i:], nil
+		}
+	}
+	return raw, nil
+}
+
 // Tool definitions
 
 func toolDefinitions() []toolDef {
@@ -235,6 +250,14 @@ func toolDefinitions() []toolDef {
 				"to_uri":   prop{Type: "string", Description: "Target URI to unlink"},
 			}, []string{"from_uri", "to_uri"}),
 		},
+		// Maintenance tools
+		{
+			Name: "ov_dedup", Description: "Find duplicate or highly similar memories in a scope. Returns groups of similar memories with their content and similarity scores. Use this before manually merging/removing duplicates.",
+			InputSchema: schema(map[string]any{
+				"uri":       prop{Type: "string", Description: "URI scope to scan for duplicates (e.g. 'viking://user/default/memories/entities/')", Default: "viking://user/default/memories/entities/"},
+				"threshold": prop{Type: "number", Description: "Similarity threshold (0.0-1.0). Higher = stricter matching. Default 0.5", Default: 0.5},
+			}, nil),
+		},
 	}
 }
 
@@ -376,6 +399,9 @@ func callTool(params callToolParams) (string, bool) {
 	case "ov_unlink":
 		args = []string{"unlink", str("from_uri"), str("to_uri")}
 
+	case "ov_dedup":
+		return dedup(a)
+
 	default:
 		return fmt.Sprintf("unknown tool: %s", params.Name), true
 	}
@@ -385,6 +411,242 @@ func callTool(params callToolParams) (string, bool) {
 		return err.Error(), true
 	}
 	return result, false
+}
+
+// Dedup implementation
+
+func dedup(a map[string]any) (string, bool) {
+	uri := "viking://user/default/memories/entities/"
+	if v, ok := a["uri"].(string); ok && v != "" {
+		uri = v
+	}
+	threshold := 0.5
+	if v, ok := a["threshold"].(float64); ok {
+		threshold = v
+	}
+
+	// Step 1: List all files in scope
+	listResult, err := ovJSON([]string{"ls", uri}, 30*time.Second)
+	if err != nil {
+		return fmt.Sprintf("failed to list %s: %v", uri, err), true
+	}
+
+	var listData struct {
+		OK     bool `json:"ok"`
+		Result []struct {
+			URI  string `json:"uri"`
+			Size int    `json:"size"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(listResult), &listData); err != nil {
+		return fmt.Sprintf("failed to parse ls result: %v", err), true
+	}
+
+	// Filter to files only
+	var files []string
+	for _, f := range listData.Result {
+		if f.Size > 0 {
+			files = append(files, f.URI)
+		}
+	}
+
+	if len(files) < 2 {
+		return `{"groups": [], "message": "fewer than 2 files, nothing to compare"}`, false
+	}
+
+	// Step 2: Read abstracts for all files (batch)
+	abstracts := make(map[string]string)
+	for _, f := range files {
+		result, err := ovJSON([]string{"abstract", f}, 15*time.Second)
+		if err != nil {
+			continue
+		}
+		// Extract abstract text from JSON response
+		var absData struct {
+			OK     bool   `json:"ok"`
+			Result string `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(result), &absData); err == nil && absData.Result != "" {
+			abstracts[f] = absData.Result
+		} else {
+			// Try raw string
+			abstracts[f] = result
+		}
+	}
+
+	// Step 3: For each file, find similar ones using ov_find with the abstract as query
+	type dupPair struct {
+		URI1  string  `json:"uri1"`
+		URI2  string  `json:"uri2"`
+		Score float64 `json:"score"`
+		Abs1  string  `json:"abstract1"`
+		Abs2  string  `json:"abstract2"`
+	}
+
+	seen := make(map[string]bool)
+	var pairs []dupPair
+
+	for _, f := range files {
+		abs, ok := abstracts[f]
+		if !ok || abs == "" {
+			continue
+		}
+
+		// Truncate abstract to first 200 chars for query
+		query := abs
+		if len(query) > 200 {
+			query = query[:200]
+		}
+
+		findResult, err := ovJSON([]string{"find", query, "-u", uri, "-n", "5"}, 30*time.Second)
+		if err != nil {
+			continue
+		}
+
+		var findData struct {
+			OK     bool `json:"ok"`
+			Result struct {
+				Memories []struct {
+					URI      string  `json:"uri"`
+					Score    float64 `json:"score"`
+					Abstract string  `json:"abstract"`
+				} `json:"memories"`
+				Resources []struct {
+					URI      string  `json:"uri"`
+					Score    float64 `json:"score"`
+					Abstract string  `json:"abstract"`
+				} `json:"resources"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(findResult), &findData); err != nil {
+			continue
+		}
+
+		// Check memories and resources for matches
+		allResults := append(findData.Result.Memories, findData.Result.Resources...)
+		for _, match := range allResults {
+			if match.URI == f {
+				continue
+			}
+			if match.Score < threshold {
+				continue
+			}
+
+			// Create canonical pair key to avoid duplicates
+			key := match.URI + "|" + f
+			if f < match.URI {
+				key = f + "|" + match.URI
+			}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			abs2 := match.Abstract
+			if abs2 == "" {
+				abs2 = abstracts[match.URI]
+			}
+
+			pairs = append(pairs, dupPair{
+				URI1:  f,
+				URI2:  match.URI,
+				Score: match.Score,
+				Abs1:  truncateStr(abstracts[f], 150),
+				Abs2:  truncateStr(abs2, 150),
+			})
+		}
+	}
+
+	// Step 4: Group pairs into clusters
+	type dupGroup struct {
+		URIs      []string `json:"uris"`
+		Abstracts []string `json:"abstracts"`
+		MaxScore  float64  `json:"max_similarity"`
+	}
+
+	// Union-find for grouping
+	parent := make(map[string]string)
+	var find func(string) string
+	find = func(x string) string {
+		if parent[x] == "" {
+			parent[x] = x
+		}
+		if parent[x] != x {
+			parent[x] = find(parent[x])
+		}
+		return parent[x]
+	}
+	union := func(a, b string) {
+		ra, rb := find(a), find(b)
+		if ra != rb {
+			parent[ra] = rb
+		}
+	}
+
+	maxScores := make(map[string]float64)
+	for _, p := range pairs {
+		union(p.URI1, p.URI2)
+		key := find(p.URI1)
+		if p.Score > maxScores[key] {
+			maxScores[key] = p.Score
+		}
+	}
+
+	groups := make(map[string]*dupGroup)
+	for _, p := range pairs {
+		root := find(p.URI1)
+		if groups[root] == nil {
+			groups[root] = &dupGroup{MaxScore: maxScores[root]}
+		}
+	}
+
+	// Collect URIs per group
+	allURIs := make(map[string]bool)
+	for _, p := range pairs {
+		allURIs[p.URI1] = true
+		allURIs[p.URI2] = true
+	}
+	for u := range allURIs {
+		root := find(u)
+		g := groups[root]
+		if g == nil {
+			continue
+		}
+		found := false
+		for _, existing := range g.URIs {
+			if existing == u {
+				found = true
+				break
+			}
+		}
+		if !found {
+			g.URIs = append(g.URIs, u)
+			g.Abstracts = append(g.Abstracts, truncateStr(abstracts[u], 150))
+		}
+	}
+
+	var result []dupGroup
+	for _, g := range groups {
+		if len(g.URIs) >= 2 {
+			result = append(result, *g)
+		}
+	}
+
+	output := map[string]any{
+		"total_files":    len(files),
+		"duplicate_groups": result,
+		"threshold":      threshold,
+	}
+
+	data, _ := json.MarshalIndent(output, "", "  ")
+	return string(data), false
+}
+
+func truncateStr(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }
 
 // Server
